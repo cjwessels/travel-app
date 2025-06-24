@@ -690,11 +690,13 @@
       let tracking = false;
       let startPosition = null;
       let currentPosition = null;
+      let previousPosition = null;
       let totalDistance = 0;
       let watchId = null;
       let startAddress = '';
       let stopAddress = '';
       let currentTrip = null;
+      let positionHistory = [];
 
       // Initialize app
       document.addEventListener('DOMContentLoaded', function () {
@@ -752,6 +754,8 @@
         tracking = true;
         totalDistance = 0;
         startPosition = null;
+        previousPosition = null;
+        positionHistory = [];
 
         // Update UI
         document.getElementById('start-btn').classList.add('hidden');
@@ -762,14 +766,14 @@
         document.getElementById('start-address').classList.remove('hidden');
         document.getElementById('current-address').classList.remove('hidden');
 
-        // Start watching position
+        // Start watching position with high accuracy settings for driving
         watchId = navigator.geolocation.watchPosition(
           updatePosition,
           handleLocationError,
           {
             enableHighAccuracy: true,
-            timeout: 10000,
-            maximumAge: 1000,
+            timeout: 15000,
+            maximumAge: 2000, // Accept positions up to 2 seconds old
           }
         );
       }
@@ -819,10 +823,28 @@
 
       // Update position
       function updatePosition(position) {
+        // Validate position accuracy (reject positions with very poor accuracy)
+        if (position.coords.accuracy > 100) {
+          console.log(
+            'Position accuracy too poor:',
+            position.coords.accuracy + 'm'
+          );
+          return;
+        }
+
         currentPosition = position;
 
         if (!startPosition) {
+          // First position - set as start
           startPosition = position;
+          previousPosition = position;
+          positionHistory.push({
+            lat: position.coords.latitude,
+            lon: position.coords.longitude,
+            timestamp: position.timestamp,
+            accuracy: position.coords.accuracy,
+          });
+
           // Get start address
           getAddressFromCoords(
             position.coords.latitude,
@@ -841,35 +863,88 @@
                 startAddress;
             });
         } else {
-          // Calculate distance
-          const distance = calculateDistance(
-            startPosition.coords.latitude,
-            startPosition.coords.longitude,
-            position.coords.latitude,
-            position.coords.longitude
-          );
+          // Calculate incremental distance from previous position
+          if (
+            previousPosition &&
+            isSignificantMovement(previousPosition, position)
+          ) {
+            const incrementalDistance = calculateDistance(
+              previousPosition.coords.latitude,
+              previousPosition.coords.longitude,
+              position.coords.latitude,
+              position.coords.longitude
+            );
 
-          totalDistance = distance;
-          document.getElementById('distance-display').textContent =
-            totalDistance.toFixed(2);
+            // Only add distance if movement is reasonable (filter out GPS noise)
+            if (incrementalDistance > 0.005 && incrementalDistance < 1) {
+              // Between 5m and 1km per update
+              totalDistance += incrementalDistance;
+              document.getElementById('distance-display').textContent =
+                totalDistance.toFixed(2);
+
+              // Update previous position for next calculation
+              previousPosition = position;
+
+              // Add to position history
+              positionHistory.push({
+                lat: position.coords.latitude,
+                lon: position.coords.longitude,
+                timestamp: position.timestamp,
+                accuracy: position.coords.accuracy,
+              });
+
+              // Keep history manageable (last 1000 points)
+              if (positionHistory.length > 1000) {
+                positionHistory = positionHistory.slice(-1000);
+              }
+            }
+          }
         }
 
-        // Update current address
-        getAddressFromCoords(
-          position.coords.latitude,
-          position.coords.longitude
-        )
-          .then((address) => {
-            document.getElementById('current-address-text').textContent =
-              address;
-          })
-          .catch((err) => {
-            document.getElementById(
-              'current-address-text'
-            ).textContent = `${position.coords.latitude.toFixed(
-              6
-            )}, ${position.coords.longitude.toFixed(6)}`;
-          });
+        // Update current address (less frequently to save resources)
+        if (
+          !window.lastAddressUpdate ||
+          Date.now() - window.lastAddressUpdate > 10000
+        ) {
+          // Every 10 seconds
+          window.lastAddressUpdate = Date.now();
+          getAddressFromCoords(
+            position.coords.latitude,
+            position.coords.longitude
+          )
+            .then((address) => {
+              document.getElementById('current-address-text').textContent =
+                address;
+            })
+            .catch((err) => {
+              document.getElementById(
+                'current-address-text'
+              ).textContent = `${position.coords.latitude.toFixed(
+                6
+              )}, ${position.coords.longitude.toFixed(6)}`;
+            });
+        }
+      }
+
+      // Check if movement is significant enough to count
+      function isSignificantMovement(pos1, pos2) {
+        const distance = calculateDistance(
+          pos1.coords.latitude,
+          pos1.coords.longitude,
+          pos2.coords.latitude,
+          pos2.coords.longitude
+        );
+
+        const timeDiff = (pos2.timestamp - pos1.timestamp) / 1000; // seconds
+        const speed = (distance * 1000) / timeDiff; // meters per second
+
+        // Filter out unrealistic speeds (over 200 km/h or under 0.5 km/h when driving)
+        // and ensure minimum distance of 5 meters to avoid GPS jitter
+        return (
+          distance >= 0.005 && // Minimum 5 meters
+          speed <= 55.6 && // Maximum ~200 km/h
+          speed >= 0.1
+        ); // Minimum ~0.4 km/h (walking speed filter)
       }
 
       // Handle location error
@@ -878,19 +953,28 @@
         alert('Unable to get location. Please check your GPS settings.');
       }
 
-      // Calculate distance between two points
+      // Calculate distance between two points using Haversine formula
       function calculateDistance(lat1, lon1, lat2, lon2) {
         const R = 6371; // Earth's radius in kilometers
-        const dLat = ((lat2 - lat1) * Math.PI) / 180;
-        const dLon = ((lon2 - lon1) * Math.PI) / 180;
+        const dLat = toRadians(lat2 - lat1);
+        const dLon = toRadians(lon2 - lon1);
+
         const a =
           Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-          Math.cos((lat1 * Math.PI) / 180) *
-            Math.cos((lat2 * Math.PI) / 180) *
+          Math.cos(toRadians(lat1)) *
+            Math.cos(toRadians(lat2)) *
             Math.sin(dLon / 2) *
             Math.sin(dLon / 2);
+
         const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        return R * c;
+        const distance = R * c;
+
+        return distance;
+      }
+
+      // Convert degrees to radians
+      function toRadians(degrees) {
+        return degrees * (Math.PI / 180);
       }
 
       // Get address from coordinates
